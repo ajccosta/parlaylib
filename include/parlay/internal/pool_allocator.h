@@ -47,12 +47,12 @@ struct pool_allocator {
  private:
   static inline constexpr size_t large_threshold = (1 << 18);
 
-  size_t num_buckets;
-  size_t num_small;
-  size_t max_small;
-  size_t max_size;
-  std::atomic<size_t> large_allocated{0};
-  std::atomic<size_t> large_used{0};
+  size_t num_buckets; //Number of blocks size categories
+  size_t num_small; //Number of small block size categories
+  size_t max_small; //Largest small block size category
+  size_t max_size; //Size of the largest block size category
+  std::atomic<size_t> large_allocated{0}; //Number of bytes used by large blocks currently allocated 
+  std::atomic<size_t> large_used{0}; //Number of bytes used large blocks currently being used (i.e., allocated by user) 
 
   std::unique_ptr<size_t[]> sizes;
   std::unique_ptr<internal::hazptr_stack<void*>[]> large_buckets;
@@ -62,14 +62,15 @@ struct pool_allocator {
 
     size_t bucket = num_small;
     size_t alloc_size;
-    large_used += n;
+    large_used += n; //Update total number of large block bytes used by user
 
     if (n <= max_size) {
+      //Get block from large_buckets
       while (n > sizes[bucket]) bucket++;
       std::optional<void*> r = large_buckets[bucket-num_small].pop();
-      if (r) return *r;
-      alloc_size = sizes[bucket];
-    } else alloc_size = n;
+      if (r) return *r; //bucket had block to fulfill desired size
+      alloc_size = sizes[bucket]; //We will allocate from this size
+    } else alloc_size = n; //Allocate something larger than is found in large buckets
 
     // Alloc size must be a multiple of the alignment
     // Round up to the next multiple.
@@ -79,19 +80,20 @@ struct pool_allocator {
 
     void* a = ::operator new(alloc_size, std::align_val_t{max_alignment});
 
-    large_allocated += n;
+    large_allocated += n; //Update total number large block of bytes allocated
     return a;
   }
 
   void deallocate_large(void* ptr, size_t n) {
-    large_used -= n;
+    large_used -= n; //Update total number of large block bytes used by user
     if (n > max_size) {
       ::operator delete(ptr, std::align_val_t{max_alignment});
-      large_allocated -= n;
+      large_allocated -= n; //Update total number of large block bytes allocated
     } else {
       size_t bucket = num_small;
-      while (n > sizes[bucket]) bucket++;
+      while (n > sizes[bucket]) bucket++; //Find bucket that block belongs to
       large_buckets[bucket-num_small].push(ptr);
+      //large buckets blocks are not deallocted
     }
   }
 
@@ -109,14 +111,20 @@ struct pool_allocator {
       num_buckets(sizes_.size()),
       sizes(std::make_unique<size_t[]>(num_buckets)) {
 
+    //Copy size array
     std::copy(std::begin(sizes_), std::end(sizes_), sizes.get());
+    //Largest size
     max_size = sizes[num_buckets-1];
+    //Calculate number of block sizes considered small
     num_small = 0;
     while (num_small < num_buckets && sizes[num_small] < large_threshold)
       num_small++;
+    //Largest small block size
     max_small = (num_small > 0) ? sizes[num_small - 1] : 0;
 
+    //Construct shared, large block size pools
     large_buckets = std::make_unique<internal::hazptr_stack<void*>[]>(num_buckets-num_small);
+    //Construct thread-local, small block size pools
     small_allocators = make_unique_array<internal::block_allocator>(num_small, [&](size_t i) {
       return internal::block_allocator(sizes[i], max_alignment);
     });
@@ -133,17 +141,23 @@ struct pool_allocator {
   }
 
   void* allocate(size_t n) {
+    //Do we consider this allocation large? If yes, allocate from large pools
     if (n > max_small) return allocate_large(n);
+    //Calculate smallest bucket needed for this allocation
     size_t bucket = 0;
     while (n > sizes[bucket]) bucket++;
+    //Allocate from smallest possible bucket
     return small_allocators[bucket].alloc();
   }
 
   void deallocate(void* ptr, size_t n) {
+    //Was this a large allocation? Return block to large bucket pool
     if (n > max_small) deallocate_large(ptr, n);
     else {
+      //Calculate smallest bucket that was needed for this allocation
       size_t bucket = 0;
       while (n > sizes[bucket]) bucket++;
+      //Return block to its bucket
       small_allocators[bucket].free(ptr);
     }
   }
@@ -182,6 +196,7 @@ struct pool_allocator {
     return {total_u, total_a-total_u};
   }
 
+  //Pop all blocks from large buckets (small buckets are managed by unique_ptr)
   void clear() {
     for (size_t i = num_small; i < num_buckets; i++) {
       std::optional<void*> r = large_buckets[i-num_small].pop();

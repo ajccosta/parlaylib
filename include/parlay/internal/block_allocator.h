@@ -57,11 +57,11 @@ struct block_allocator {
   hazptr_stack<block*> global_stack;
   ThreadSpecific<local_list> my_local_list;
 
-  size_t block_size;
+  size_t block_size; //Size of each block
   std::align_val_t block_align;
-  size_t list_length;
-  size_t max_blocks;
-  std::atomic<size_t> blocks_allocated;
+  size_t list_length; //Size of each local list and used for the threshold to return blocks to global pool
+  size_t max_blocks; //Maximum number of blocks accross all threads
+  std::atomic<size_t> blocks_allocated; //Number of blocks allocated (accross all threads)
 
   block* get_block(std::byte* buffer, size_t i) const {
     // Since block is an aggregate type, it has implicit lifetime, so the following code
@@ -82,15 +82,23 @@ struct block_allocator {
   // Allocate a new list of list_length elements
 
   auto initialize_list(std::byte* buffer) const -> block* {
+    //Allocate list into buffer
+    //For each element, except the last, set the next ptr to the following element
     for (size_t i=0; i < list_length - 1; i++) {
       new (buffer + i * block_size) block{get_block(buffer, i+1)};
     }
+    //The last element has next set to nullptr
     new (buffer + (list_length - 1) * block_size) block{nullptr};
+    //Return first element
     return get_block(buffer, 0);
   }
 
+  //Return the number of blocks requested by the user
   size_t num_used_blocks() {
+    //The number of blocks in the global shared pool
     size_t free_blocks = global_stack.size()*list_length;
+    //Sum the number blocks in each thread's local list
+    //  (ThreadSpecific allows iteration over all thread's objects)
     my_local_list.for_each([&](auto&& list) {
       free_blocks += list.sz;
     });
@@ -183,20 +191,23 @@ struct block_allocator {
   void free(void* ptr) {
 
     if (my_local_list->sz == list_length+1) {
+      //Record middle of the list
       my_local_list->mid = my_local_list->head;
     } else if (my_local_list->sz == 2*list_length) {
+      //Return half of the list to the global pool
       global_stack.push(my_local_list->mid->next);
       my_local_list->mid->next = nullptr;
       my_local_list->sz = list_length;
     }
 
+    //Insert freed note at the head of the list
     auto new_node = new (ptr) block{my_local_list->head};
     my_local_list->head = new_node;
     my_local_list->sz++;
   }
 
   inline void* alloc() {
-    if (my_local_list->sz == 0)  {
+    if (my_local_list->sz == 0)  { //No blocks on the local list, get a new list
       auto new_list = get_list();
 
       // !! Critical problem !! If this task got stolen during get_list(), the
@@ -216,6 +227,7 @@ struct block_allocator {
       }
     }
 
+    //Pop block from head of local list
     block* p = my_local_list->head;
     my_local_list->head = my_local_list->head->next;
     my_local_list->sz--;
