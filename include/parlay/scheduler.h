@@ -92,7 +92,7 @@ struct scheduler {
   // before it goes to sleep to save CPU time.
   constexpr static std::chrono::microseconds STEAL_TIMEOUT{PARLAY_ELASTIC_STEAL_TIMEOUT};
 
-  static inline thread_local workerInfo worker_info{};
+  static inline thread_local std::unique_ptr<workerInfo> worker_info;
 
  public:
 
@@ -101,23 +101,25 @@ struct scheduler {
   // If the current thread is a worker of an existing scheduler, or the thread that spawned
   // a scheduler, return the most recent such scheduler.  Otherwise, returns null.
   static scheduler* get_current_scheduler() {
-    return worker_info.my_scheduler;
+    if(!worker_info) return nullptr;
+    return worker_info->my_scheduler;
   }
 
   explicit scheduler(size_t num_workers)
       : num_threads(num_workers),
         num_deques(num_threads),
         num_awake_workers(num_threads),
-        parent_worker_info(std::exchange(worker_info, workerInfo{0, this})),
+        parent_worker_info(std::move(worker_info)),
         deques(num_deques),
         attempts(num_deques),
         spawned_threads(),
         finished_flag(false) {
 
+    worker_info = std::unique_ptr<workerInfo>(new workerInfo(0, this));
     // Spawn num_threads many threads on startup
     for (worker_id_type i = 1; i < num_threads; ++i) {
       spawned_threads.emplace_back([&, i]() {
-        worker_info = {i, this};
+        worker_info = std::unique_ptr<workerInfo>(new workerInfo(i, this));
         worker();
       });
     }
@@ -165,7 +167,10 @@ struct scheduler {
   }
 
   worker_id_type num_workers() { return num_threads; }
-  worker_id_type worker_id() { return worker_info.worker_id; }
+  worker_id_type worker_id() {
+    if(!worker_info) return 0;
+    return worker_info->worker_id;
+  }
 
   bool finished() const noexcept {
     return finished_flag.load(std::memory_order_acquire);
@@ -179,7 +184,7 @@ struct scheduler {
 
   int num_deques;
   std::atomic<size_t> num_awake_workers;
-  workerInfo parent_worker_info;
+  std::unique_ptr<workerInfo> parent_worker_info;
   std::vector<internal::Deque<Job>> deques;
   std::vector<attempt> attempts;
   std::vector<std::thread> spawned_threads;
